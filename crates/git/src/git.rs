@@ -3,6 +3,7 @@ pub mod commit;
 mod hosting_provider;
 mod remote;
 pub mod repository;
+pub mod stash;
 pub mod status;
 
 pub use crate::hosting_provider::*;
@@ -10,6 +11,7 @@ pub use crate::remote::*;
 use anyhow::{Context as _, Result};
 pub use git2 as libgit;
 use gpui::{Action, actions};
+pub use repository::RemoteCommandOutput;
 pub use repository::WORK_DIRECTORY_REPO_PATH;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -59,6 +61,8 @@ actions!(
         StashAll,
         /// Pops the most recent stash.
         StashPop,
+        /// Apply the most recent stash.
+        StashApply,
         /// Restores all tracked files to their last committed state.
         RestoreTrackedFiles,
         /// Moves all untracked files to trash.
@@ -93,8 +97,22 @@ actions!(
         Init,
         /// Opens all modified files in the editor.
         OpenModifiedFiles,
+        /// Clones a repository.
+        Clone,
     ]
 );
+
+/// Renames a git branch.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct RenameBranch {
+    /// The branch to rename.
+    ///
+    /// Default: the current branch.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
 
 /// Restores a file to its last committed state, discarding local changes.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
@@ -115,6 +133,13 @@ impl Oid {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let oid = libgit::Oid::from_bytes(bytes).context("failed to parse bytes into git oid")?;
         Ok(Self(oid))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn random(rng: &mut impl rand::Rng) -> Self {
+        let mut bytes = [0; 20];
+        rng.fill(&mut bytes);
+        Self::from_bytes(&bytes).unwrap()
     }
 
     pub fn as_bytes(&self) -> &[u8] {
