@@ -1,9 +1,12 @@
-use language::LanguageId;
+use cloud_llm_client::predict_edits_v3::{self, Line};
+use language::{Language, LanguageId};
 use project::ProjectEntryId;
-use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
+use std::{borrow::Cow, path::Path};
 use text::{Bias, BufferId, Rope};
+use util::paths::{path_ends_with, strip_path_suffix};
+use util::rel_path::RelPath;
 
 use crate::outline::OutlineDeclaration;
 
@@ -22,12 +25,14 @@ pub enum Declaration {
     File {
         project_entry_id: ProjectEntryId,
         declaration: FileDeclaration,
+        cached_path: CachedDeclarationPath,
     },
     Buffer {
         project_entry_id: ProjectEntryId,
         buffer_id: BufferId,
         rope: Rope,
         declaration: BufferDeclaration,
+        cached_path: CachedDeclarationPath,
     },
 }
 
@@ -41,6 +46,27 @@ impl Declaration {
         }
     }
 
+    pub fn parent(&self) -> Option<DeclarationId> {
+        match self {
+            Declaration::File { declaration, .. } => declaration.parent,
+            Declaration::Buffer { declaration, .. } => declaration.parent,
+        }
+    }
+
+    pub fn as_buffer(&self) -> Option<&BufferDeclaration> {
+        match self {
+            Declaration::File { .. } => None,
+            Declaration::Buffer { declaration, .. } => Some(declaration),
+        }
+    }
+
+    pub fn as_file(&self) -> Option<&FileDeclaration> {
+        match self {
+            Declaration::Buffer { .. } => None,
+            Declaration::File { declaration, .. } => Some(declaration),
+        }
+    }
+
     pub fn project_entry_id(&self) -> ProjectEntryId {
         match self {
             Declaration::File {
@@ -49,6 +75,32 @@ impl Declaration {
             Declaration::Buffer {
                 project_entry_id, ..
             } => *project_entry_id,
+        }
+    }
+
+    pub fn cached_path(&self) -> &CachedDeclarationPath {
+        match self {
+            Declaration::File { cached_path, .. } => cached_path,
+            Declaration::Buffer { cached_path, .. } => cached_path,
+        }
+    }
+
+    pub fn item_range(&self) -> Range<usize> {
+        match self {
+            Declaration::File { declaration, .. } => declaration.item_range.clone(),
+            Declaration::Buffer { declaration, .. } => declaration.item_range.clone(),
+        }
+    }
+
+    pub fn item_line_range(&self) -> Range<Line> {
+        match self {
+            Declaration::File { declaration, .. } => declaration.item_line_range.clone(),
+            Declaration::Buffer {
+                declaration, rope, ..
+            } => {
+                Line(rope.offset_to_point(declaration.item_range.start).row)
+                    ..Line(rope.offset_to_point(declaration.item_range.end).row)
+            }
         }
     }
 
@@ -71,7 +123,7 @@ impl Declaration {
     pub fn signature_text(&self) -> (Cow<'_, str>, bool) {
         match self {
             Declaration::File { declaration, .. } => (
-                declaration.text[declaration.signature_range_in_text.clone()].into(),
+                declaration.text[self.signature_range_in_item_text()].into(),
                 declaration.signature_is_truncated,
             ),
             Declaration::Buffer {
@@ -83,13 +135,39 @@ impl Declaration {
             ),
         }
     }
+
+    pub fn signature_range(&self) -> Range<usize> {
+        match self {
+            Declaration::File { declaration, .. } => declaration.signature_range.clone(),
+            Declaration::Buffer { declaration, .. } => declaration.signature_range.clone(),
+        }
+    }
+
+    pub fn signature_line_range(&self) -> Range<Line> {
+        match self {
+            Declaration::File { declaration, .. } => declaration.signature_line_range.clone(),
+            Declaration::Buffer {
+                declaration, rope, ..
+            } => {
+                Line(rope.offset_to_point(declaration.signature_range.start).row)
+                    ..Line(rope.offset_to_point(declaration.signature_range.end).row)
+            }
+        }
+    }
+
+    pub fn signature_range_in_item_text(&self) -> Range<usize> {
+        let signature_range = self.signature_range();
+        let item_range = self.item_range();
+        signature_range.start.saturating_sub(item_range.start)
+            ..(signature_range.end.saturating_sub(item_range.start)).min(item_range.len())
+    }
 }
 
 fn expand_range_to_line_boundaries_and_truncate(
     range: &Range<usize>,
     limit: usize,
     rope: &Rope,
-) -> (Range<usize>, bool) {
+) -> (Range<usize>, Range<predict_edits_v3::Line>, bool) {
     let mut point_range = rope.offset_to_point(range.start)..rope.offset_to_point(range.end);
     point_range.start.column = 0;
     point_range.end.row += 1;
@@ -102,7 +180,10 @@ fn expand_range_to_line_boundaries_and_truncate(
         item_range.end = item_range.start + limit;
     }
     item_range.end = rope.clip_offset(item_range.end, Bias::Left);
-    (item_range, is_truncated)
+
+    let line_range =
+        predict_edits_v3::Line(point_range.start.row)..predict_edits_v3::Line(point_range.end.row);
+    (item_range, line_range, is_truncated)
 }
 
 #[derive(Debug, Clone)]
@@ -110,50 +191,59 @@ pub struct FileDeclaration {
     pub parent: Option<DeclarationId>,
     pub identifier: Identifier,
     /// offset range of the declaration in the file, expanded to line boundaries and truncated
-    pub item_range_in_file: Range<usize>,
-    /// text of `item_range_in_file`
+    pub item_range: Range<usize>,
+    /// line range of the declaration in the file, potentially truncated
+    pub item_line_range: Range<predict_edits_v3::Line>,
+    /// text of `item_range`
     pub text: Arc<str>,
     /// whether `text` was truncated
     pub text_is_truncated: bool,
-    /// offset range of the signature within `text`
-    pub signature_range_in_text: Range<usize>,
+    /// offset range of the signature in the file, expanded to line boundaries and truncated
+    pub signature_range: Range<usize>,
+    /// line range of the signature in the file, truncated
+    pub signature_line_range: Range<Line>,
     /// whether `signature` was truncated
     pub signature_is_truncated: bool,
 }
 
 impl FileDeclaration {
     pub fn from_outline(declaration: OutlineDeclaration, rope: &Rope) -> FileDeclaration {
-        let (item_range_in_file, text_is_truncated) = expand_range_to_line_boundaries_and_truncate(
-            &declaration.item_range,
-            ITEM_TEXT_TRUNCATION_LENGTH,
-            rope,
-        );
+        let (item_range_in_file, item_line_range_in_file, text_is_truncated) =
+            expand_range_to_line_boundaries_and_truncate(
+                &declaration.item_range,
+                ITEM_TEXT_TRUNCATION_LENGTH,
+                rope,
+            );
 
-        // TODO: consider logging if unexpected
-        let signature_start = declaration
-            .signature_range
-            .start
-            .saturating_sub(item_range_in_file.start);
-        let mut signature_end = declaration
-            .signature_range
-            .end
-            .saturating_sub(item_range_in_file.start);
-        let signature_is_truncated = signature_end > item_range_in_file.len();
-        if signature_is_truncated {
-            signature_end = item_range_in_file.len();
+        let (mut signature_range_in_file, signature_line_range, mut signature_is_truncated) =
+            expand_range_to_line_boundaries_and_truncate(
+                &declaration.signature_range,
+                ITEM_TEXT_TRUNCATION_LENGTH,
+                rope,
+            );
+
+        if signature_range_in_file.start < item_range_in_file.start {
+            signature_range_in_file.start = item_range_in_file.start;
+            signature_is_truncated = true;
+        }
+        if signature_range_in_file.end > item_range_in_file.end {
+            signature_range_in_file.end = item_range_in_file.end;
+            signature_is_truncated = true;
         }
 
         FileDeclaration {
             parent: None,
             identifier: declaration.identifier,
-            signature_range_in_text: signature_start..signature_end,
+            signature_range: signature_range_in_file,
+            signature_line_range,
             signature_is_truncated,
             text: rope
                 .chunks_in_range(item_range_in_file.clone())
                 .collect::<String>()
                 .into(),
             text_is_truncated,
-            item_range_in_file,
+            item_range: item_range_in_file,
+            item_line_range: item_line_range_in_file,
         }
     }
 }
@@ -170,12 +260,13 @@ pub struct BufferDeclaration {
 
 impl BufferDeclaration {
     pub fn from_outline(declaration: OutlineDeclaration, rope: &Rope) -> Self {
-        let (item_range, item_range_is_truncated) = expand_range_to_line_boundaries_and_truncate(
-            &declaration.item_range,
-            ITEM_TEXT_TRUNCATION_LENGTH,
-            rope,
-        );
-        let (signature_range, signature_range_is_truncated) =
+        let (item_range, _item_line_range, item_range_is_truncated) =
+            expand_range_to_line_boundaries_and_truncate(
+                &declaration.item_range,
+                ITEM_TEXT_TRUNCATION_LENGTH,
+                rope,
+            );
+        let (signature_range, _signature_line_range, signature_range_is_truncated) =
             expand_range_to_line_boundaries_and_truncate(
                 &declaration.signature_range,
                 ITEM_TEXT_TRUNCATION_LENGTH,
@@ -188,6 +279,72 @@ impl BufferDeclaration {
             item_range_is_truncated,
             signature_range,
             signature_range_is_truncated,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedDeclarationPath {
+    pub worktree_abs_path: Arc<Path>,
+    pub rel_path: Arc<RelPath>,
+    /// The relative path of the file, possibly stripped according to `import_path_strip_regex`.
+    pub rel_path_after_regex_stripping: Arc<RelPath>,
+}
+
+impl CachedDeclarationPath {
+    pub fn new(
+        worktree_abs_path: Arc<Path>,
+        path: &Arc<RelPath>,
+        language: Option<&Arc<Language>>,
+    ) -> Self {
+        let rel_path = path.clone();
+        let rel_path_after_regex_stripping = if let Some(language) = language
+            && let Some(strip_regex) = language.config().import_path_strip_regex.as_ref()
+            && let Ok(stripped) = RelPath::unix(&Path::new(
+                strip_regex.replace_all(rel_path.as_unix_str(), "").as_ref(),
+            )) {
+            Arc::from(stripped)
+        } else {
+            rel_path.clone()
+        };
+        CachedDeclarationPath {
+            worktree_abs_path,
+            rel_path,
+            rel_path_after_regex_stripping,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(worktree_abs_path: &str, rel_path: &str) -> Self {
+        let rel_path: Arc<RelPath> = util::rel_path::rel_path(rel_path).into();
+        CachedDeclarationPath {
+            worktree_abs_path: std::path::PathBuf::from(worktree_abs_path).into(),
+            rel_path_after_regex_stripping: rel_path.clone(),
+            rel_path,
+        }
+    }
+
+    pub fn ends_with_posix_path(&self, path: &Path) -> bool {
+        if path.as_os_str().len() <= self.rel_path_after_regex_stripping.as_unix_str().len() {
+            path_ends_with(self.rel_path_after_regex_stripping.as_std_path(), path)
+        } else {
+            if let Some(remaining) =
+                strip_path_suffix(path, self.rel_path_after_regex_stripping.as_std_path())
+            {
+                path_ends_with(&self.worktree_abs_path, remaining)
+            } else {
+                false
+            }
+        }
+    }
+
+    pub fn equals_absolute_path(&self, path: &Path) -> bool {
+        if let Some(remaining) =
+            strip_path_suffix(path, &self.rel_path_after_regex_stripping.as_std_path())
+        {
+            self.worktree_abs_path.as_ref() == remaining
+        } else {
+            false
         }
     }
 }

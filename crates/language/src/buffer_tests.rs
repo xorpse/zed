@@ -24,6 +24,7 @@ use text::{BufferId, LineEnding};
 use text::{Point, ToPoint};
 use theme::ActiveTheme;
 use unindent::Unindent as _;
+use util::rel_path::rel_path;
 use util::test::marked_text_offsets;
 use util::{RandomCharIter, assert_set_eq, post_inc, test::marked_text_ranges};
 
@@ -268,7 +269,7 @@ async fn test_first_line_pattern(cx: &mut TestAppContext) {
 async fn test_language_for_file_with_custom_file_types(cx: &mut TestAppContext) {
     cx.update(|cx| {
         init_settings(cx, |settings| {
-            settings.file_types.extend([
+            settings.file_types.get_or_insert_default().extend([
                 ("TypeScript".into(), vec!["js".into()].into()),
                 (
                     "JavaScript".into(),
@@ -380,7 +381,7 @@ async fn test_language_for_file_with_custom_file_types(cx: &mut TestAppContext) 
 
 fn file(path: &str) -> Arc<dyn File> {
     Arc::new(TestFile {
-        path: Path::new(path).into(),
+        path: Arc::from(rel_path(path)),
         root_name: "zed".into(),
         local_root: None,
     })
@@ -1052,6 +1053,21 @@ async fn test_symbols_containing(cx: &mut gpui::TestAppContext) {
             })
             .collect()
     }
+
+    let (text, offsets) = marked_text_offsets(
+        &"
+        // ˇ😅 //
+        fn test() {
+        }
+    "
+        .unindent(),
+    );
+    let buffer = cx.new(|cx| Buffer::local(text, cx).with_language(Arc::new(rust_lang()), cx));
+    let snapshot = buffer.update(cx, |buffer, _| buffer.snapshot());
+
+    // note, it would be nice to actually return the method test in this
+    // case, but primarily asserting we don't crash because of the multibyte character.
+    assert_eq!(snapshot.symbols_containing(offsets[0], None), vec![]);
 }
 
 #[gpui::test]

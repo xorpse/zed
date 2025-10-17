@@ -1,6 +1,10 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context as _, Result};
+use askpass::EncryptedPassword;
 use auto_update::AutoUpdater;
 use editor::Editor;
 use extension_host::ExtensionStore;
@@ -11,11 +15,11 @@ use gpui::{
     TextStyleRefinement, WeakEntity,
 };
 
-use language::CursorShape;
+use language::{CursorShape, Point};
 use markdown::{Markdown, MarkdownElement, MarkdownStyle};
 use release_channel::ReleaseChannel;
 use remote::{
-    ConnectionIdentifier, RemoteClient, RemoteConnectionOptions, RemotePlatform,
+    ConnectionIdentifier, RemoteClient, RemoteConnection, RemoteConnectionOptions, RemotePlatform,
     SshConnectionOptions,
 };
 pub use settings::SshConnection;
@@ -25,6 +29,7 @@ use ui::{
     ActiveTheme, Color, CommonAnimationExt, Context, Icon, IconName, IconSize, InteractiveElement,
     IntoElement, Label, LabelCommon, Styled, Window, prelude::*,
 };
+use util::paths::PathWithPosition;
 use workspace::{AppState, ModalView, Workspace};
 
 pub struct SshSettings {
@@ -103,7 +108,7 @@ impl From<WslConnection> for Connection {
 }
 
 impl Settings for SshSettings {
-    fn from_settings(content: &settings::SettingsContent, _cx: &mut App) -> Self {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
         let remote = &content.remote;
         Self {
             ssh_connections: remote.ssh_connections.clone().unwrap_or_default().into(),
@@ -118,7 +123,7 @@ pub struct RemoteConnectionPrompt {
     nickname: Option<SharedString>,
     is_wsl: bool,
     status_message: Option<SharedString>,
-    prompt: Option<(Entity<Markdown>, oneshot::Sender<String>)>,
+    prompt: Option<(Entity<Markdown>, oneshot::Sender<EncryptedPassword>)>,
     cancellation: Option<oneshot::Sender<()>>,
     editor: Entity<Editor>,
 }
@@ -160,10 +165,10 @@ impl RemoteConnectionPrompt {
         self.cancellation = Some(tx);
     }
 
-    pub fn set_prompt(
+    fn set_prompt(
         &mut self,
         prompt: String,
-        tx: oneshot::Sender<String>,
+        tx: oneshot::Sender<EncryptedPassword>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -203,8 +208,12 @@ impl RemoteConnectionPrompt {
     pub fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((_, tx)) = self.prompt.take() {
             self.status_message = Some("Connecting".into());
+
             self.editor.update(cx, |editor, cx| {
-                tx.send(editor.text(cx)).ok();
+                let pw = editor.text(cx);
+                if let Ok(secure) = EncryptedPassword::try_from(pw.as_ref()) {
+                    tx.send(secure).ok();
+                }
                 editor.clear(window, cx);
             });
         }
@@ -364,7 +373,7 @@ impl RenderOnce for SshConnectionHeader {
                     )
                     .child(div().overflow_x_hidden().text_ellipsis().children(
                         self.paths.into_iter().map(|path| {
-                            Label::new(path.to_string_lossy().to_string())
+                            Label::new(path.to_string_lossy().into_owned())
                                 .size(LabelSize::Small)
                                 .color(Color::Muted)
                         }),
@@ -438,11 +447,16 @@ impl ModalView for RemoteConnectionModal {
 pub struct RemoteClientDelegate {
     window: AnyWindowHandle,
     ui: WeakEntity<RemoteConnectionPrompt>,
-    known_password: Option<String>,
+    known_password: Option<EncryptedPassword>,
 }
 
 impl remote::RemoteClientDelegate for RemoteClientDelegate {
-    fn ask_password(&self, prompt: String, tx: oneshot::Sender<String>, cx: &mut AsyncApp) {
+    fn ask_password(
+        &self,
+        prompt: String,
+        tx: oneshot::Sender<EncryptedPassword>,
+        cx: &mut AsyncApp,
+    ) {
         let mut known_password = self.known_password.clone();
         if let Some(password) = known_password.take() {
             tx.send(password).ok();
@@ -523,31 +537,6 @@ impl RemoteClientDelegate {
     }
 }
 
-pub fn connect_over_ssh(
-    unique_identifier: ConnectionIdentifier,
-    connection_options: SshConnectionOptions,
-    ui: Entity<RemoteConnectionPrompt>,
-    window: &mut Window,
-    cx: &mut App,
-) -> Task<Result<Option<Entity<RemoteClient>>>> {
-    let window = window.window_handle();
-    let known_password = connection_options.password.clone();
-    let (tx, rx) = oneshot::channel();
-    ui.update(cx, |ui, _cx| ui.set_cancellation_tx(tx));
-
-    remote::RemoteClient::ssh(
-        unique_identifier,
-        connection_options,
-        rx,
-        Arc::new(RemoteClientDelegate {
-            window,
-            ui: ui.downgrade(),
-            known_password,
-        }),
-        cx,
-    )
-}
-
 pub fn connect(
     unique_identifier: ConnectionIdentifier,
     connection_options: RemoteConnectionOptions,
@@ -557,25 +546,26 @@ pub fn connect(
 ) -> Task<Result<Option<Entity<RemoteClient>>>> {
     let window = window.window_handle();
     let known_password = match &connection_options {
-        RemoteConnectionOptions::Ssh(ssh_connection_options) => {
-            ssh_connection_options.password.clone()
-        }
+        RemoteConnectionOptions::Ssh(ssh_connection_options) => ssh_connection_options
+            .password
+            .as_deref()
+            .and_then(|pw| pw.try_into().ok()),
         _ => None,
     };
     let (tx, rx) = oneshot::channel();
     ui.update(cx, |ui, _cx| ui.set_cancellation_tx(tx));
 
-    remote::RemoteClient::new(
-        unique_identifier,
-        connection_options,
-        rx,
-        Arc::new(RemoteClientDelegate {
-            window,
-            ui: ui.downgrade(),
-            known_password,
-        }),
-        cx,
-    )
+    let delegate = Arc::new(RemoteClientDelegate {
+        window,
+        ui: ui.downgrade(),
+        known_password,
+    });
+
+    cx.spawn(async move |cx| {
+        let connection = remote::connect(connection_options, delegate.clone(), cx).await?;
+        cx.update(|cx| remote::RemoteClient::new(unique_identifier, connection, rx, delegate, cx))?
+            .await
+    })
 }
 
 pub async fn open_remote_project(
@@ -590,6 +580,7 @@ pub async fn open_remote_project(
     } else {
         let workspace_position = cx
             .update(|cx| {
+                // todo: These paths are wrong they may have column and line information
                 workspace::remote_workspace_position_from_db(connection_options.clone(), &paths, cx)
             })?
             .await
@@ -644,7 +635,10 @@ pub async fn open_remote_project(
                     known_password: if let RemoteConnectionOptions::Ssh(options) =
                         &connection_options
                     {
-                        options.password.clone()
+                        options
+                            .password
+                            .as_deref()
+                            .and_then(|pw| EncryptedPassword::try_from(pw).ok())
                     } else {
                         None
                     },
@@ -654,11 +648,16 @@ pub async fn open_remote_project(
 
         let Some(delegate) = delegate else { break };
 
-        let did_open_project = cx
+        let remote_connection =
+            remote::connect(connection_options.clone(), delegate.clone(), cx).await?;
+        let (paths, paths_with_positions) =
+            determine_paths_with_positions(&remote_connection, paths.clone()).await;
+
+        let opened_items = cx
             .update(|cx| {
                 workspace::open_remote_project_with_new_connection(
                     window,
-                    connection_options.clone(),
+                    remote_connection,
                     cancel_rx,
                     delegate.clone(),
                     app_state.clone(),
@@ -676,25 +675,51 @@ pub async fn open_remote_project(
             })
             .ok();
 
-        if let Err(e) = did_open_project {
-            log::error!("Failed to open project: {e:?}");
-            let response = window
-                .update(cx, |_, window, cx| {
-                    window.prompt(
-                        PromptLevel::Critical,
-                        match connection_options {
-                            RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
-                            RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
-                        },
-                        Some(&e.to_string()),
-                        &["Retry", "Ok"],
-                        cx,
-                    )
-                })?
-                .await;
-
-            if response == Ok(0) {
-                continue;
+        match opened_items {
+            Err(e) => {
+                log::error!("Failed to open project: {e:?}");
+                let response = window
+                    .update(cx, |_, window, cx| {
+                        window.prompt(
+                            PromptLevel::Critical,
+                            match connection_options {
+                                RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
+                                RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
+                            },
+                            Some(&e.to_string()),
+                            &["Retry", "Ok"],
+                            cx,
+                        )
+                    })?
+                    .await;
+                if response == Ok(0) {
+                    continue;
+                }
+            }
+            Ok(items) => {
+                for (item, path) in items.into_iter().zip(paths_with_positions) {
+                    let Some(item) = item else {
+                        continue;
+                    };
+                    let Some(row) = path.row else {
+                        continue;
+                    };
+                    if let Some(active_editor) = item.downcast::<Editor>() {
+                        window
+                            .update(cx, |_, window, cx| {
+                                active_editor.update(cx, |editor, cx| {
+                                    let row = row.saturating_sub(1);
+                                    let col = path.column.unwrap_or(0).saturating_sub(1);
+                                    editor.go_to_singleton_buffer_point(
+                                        Point::new(row, col),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            })
+                            .ok();
+                    }
+                }
             }
         }
 
@@ -712,4 +737,45 @@ pub async fn open_remote_project(
 
     // Already showed the error to the user
     Ok(())
+}
+
+pub(crate) async fn determine_paths_with_positions(
+    remote_connection: &Arc<dyn RemoteConnection>,
+    mut paths: Vec<PathBuf>,
+) -> (Vec<PathBuf>, Vec<PathWithPosition>) {
+    let mut paths_with_positions = Vec::<PathWithPosition>::new();
+    for path in &mut paths {
+        if let Some(path_str) = path.to_str() {
+            let path_with_position = PathWithPosition::parse_str(&path_str);
+            if path_with_position.row.is_some() {
+                if !path_exists(&remote_connection, &path).await {
+                    *path = path_with_position.path.clone();
+                    paths_with_positions.push(path_with_position);
+                    continue;
+                }
+            }
+        }
+        paths_with_positions.push(PathWithPosition::from_path(path.clone()))
+    }
+    (paths, paths_with_positions)
+}
+
+async fn path_exists(connection: &Arc<dyn RemoteConnection>, path: &Path) -> bool {
+    let Ok(command) = connection.build_command(
+        Some("test".to_string()),
+        &["-e".to_owned(), path.to_string_lossy().to_string()],
+        &Default::default(),
+        None,
+        None,
+    ) else {
+        return false;
+    };
+    let Ok(mut child) = util::command::new_smol_command(command.program)
+        .args(command.args)
+        .envs(command.env)
+        .spawn()
+    else {
+        return false;
+    };
+    child.status().await.is_ok_and(|status| status.success())
 }

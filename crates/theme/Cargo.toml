@@ -23,7 +23,6 @@ derive_more.workspace = true
 fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
-indexmap.workspace = true
 log.workspace = true
 palette = { workspace = true, default-features = false, features = ["std"] }
 parking_lot.workspace = true
@@ -37,7 +36,6 @@ strum.workspace = true
 thiserror.workspace = true
 util.workspace = true
 uuid.workspace = true
-workspace-hack.workspace = true
 
 [dev-dependencies]
 fs = { workspace = true, features = ["test-support"] }

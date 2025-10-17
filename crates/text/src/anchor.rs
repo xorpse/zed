@@ -45,43 +45,40 @@ impl Anchor {
             .then_with(|| self.bias.cmp(&other.bias))
     }
 
-    pub fn min(&self, other: &Self, buffer: &BufferSnapshot) -> Self {
+    pub fn min<'a>(&'a self, other: &'a Self, buffer: &BufferSnapshot) -> &'a Self {
         if self.cmp(other, buffer).is_le() {
-            *self
+            self
         } else {
-            *other
+            other
         }
     }
 
-    pub fn max(&self, other: &Self, buffer: &BufferSnapshot) -> Self {
+    pub fn max<'a>(&'a self, other: &'a Self, buffer: &BufferSnapshot) -> &'a Self {
         if self.cmp(other, buffer).is_ge() {
-            *self
+            self
         } else {
-            *other
+            other
         }
     }
 
     pub fn bias(&self, bias: Bias, buffer: &BufferSnapshot) -> Anchor {
-        if bias == Bias::Left {
-            self.bias_left(buffer)
-        } else {
-            self.bias_right(buffer)
+        match bias {
+            Bias::Left => self.bias_left(buffer),
+            Bias::Right => self.bias_right(buffer),
         }
     }
 
     pub fn bias_left(&self, buffer: &BufferSnapshot) -> Anchor {
-        if self.bias == Bias::Left {
-            *self
-        } else {
-            buffer.anchor_before(self)
+        match self.bias {
+            Bias::Left => *self,
+            Bias::Right => buffer.anchor_before(self),
         }
     }
 
     pub fn bias_right(&self, buffer: &BufferSnapshot) -> Anchor {
-        if self.bias == Bias::Right {
-            *self
-        } else {
-            buffer.anchor_after(self)
+        match self.bias {
+            Bias::Left => buffer.anchor_after(self),
+            Bias::Right => *self,
         }
     }
 
@@ -96,7 +93,7 @@ impl Anchor {
     pub fn is_valid(&self, buffer: &BufferSnapshot) -> bool {
         if *self == Anchor::MIN || *self == Anchor::MAX {
             true
-        } else if self.buffer_id != Some(buffer.remote_id) {
+        } else if self.buffer_id.is_none_or(|id| id != buffer.remote_id) {
             false
         } else {
             let Some(fragment_id) = buffer.try_fragment_id_for_anchor(self) else {
