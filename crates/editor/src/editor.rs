@@ -237,6 +237,7 @@ pub const FETCH_COLORS_DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(150);
 
 pub(crate) const EDIT_PREDICTION_KEY_CONTEXT: &str = "edit_prediction";
 pub(crate) const EDIT_PREDICTION_CONFLICT_KEY_CONTEXT: &str = "edit_prediction_conflict";
+pub(crate) const LINE_WHITESPACE_UPTO_CURSOR_KEY_CONTEXT: &str = "line_whitespace_upto_cursor";
 pub(crate) const MINIMAP_FONT_SIZE: AbsoluteLength = AbsoluteLength::Pixels(px(2.));
 
 pub type RenderDiffHunkControlsFn = Arc<
@@ -1122,6 +1123,7 @@ pub struct Editor {
     edit_prediction_preview: EditPredictionPreview,
     edit_prediction_indent_conflict: bool,
     edit_prediction_requires_modifier_in_indent_conflict: bool,
+    line_whitespace_upto_cursor: bool,
     next_inlay_id: usize,
     next_color_inlay_id: usize,
     _subscriptions: Vec<Subscription>,
@@ -2257,6 +2259,7 @@ impl Editor {
             edit_prediction_settings: EditPredictionSettings::Disabled,
             edit_prediction_indent_conflict: false,
             edit_prediction_requires_modifier_in_indent_conflict: true,
+            line_whitespace_upto_cursor: false,
             custom_context_menu: None,
             show_git_blame_gutter: false,
             show_git_blame_inline: false,
@@ -2591,7 +2594,9 @@ impl Editor {
                     key_context.add("showing_code_actions")
                 }
             }
-            None => {}
+            None => if self.line_is_whitespace_upto_cursor(cx) {
+                key_context.add(LINE_WHITESPACE_UPTO_CURSOR_KEY_CONTEXT);
+            }
         }
 
         if self.signature_help_state.has_multiple_signatures() {
@@ -5412,6 +5417,15 @@ impl Editor {
             }
             Ok(())
         }))
+    }
+
+    pub fn line_is_whitespace_upto_cursor(&self, cx: &App) -> bool {
+        self.line_whitespace_upto_cursor || {
+            let multibuffer_snapshot = self.buffer.read(cx).read(cx);
+            let position = self.selections.newest_anchor().head();
+
+            multibuffer_snapshot.is_line_whitespace_upto(position)
+        }
     }
 
     pub fn show_word_completions(
